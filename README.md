@@ -1,6 +1,6 @@
-# Python-Stuff 🧪🐍
+# Python and SQL Stuff 🧪🐍
 
-This is a personal sandbox where I experiment, build, and improve my Python skills across a wide range of applications — from nuclear engineering tools to fractal generation and code obfuscation.
+This is a personal sandbox where I experiment, build, and improve my Python and SQL skills across a wide range of applications.
 
 ## 🧠 Focus Areas
 - Numerical methods & reactor physics
