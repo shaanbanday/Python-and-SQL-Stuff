@@ -1,0 +1,207 @@
+BEGIN;
+
+-- ============================================================================
+-- 1) LOOKUP TABLES
+-- ============================================================================
+
+-- Confinement method catalog, minimal but extensible.
+CREATE TABLE IF NOT EXISTS confinement_method (
+    method_id        SMALLSERIAL PRIMARY KEY,
+    method_name      TEXT NOT NULL UNIQUE,  -- tokamak, stellarator, ICF, mirror, FRC, etc.
+    method_category  TEXT NOT NULL,         -- magnetic, inertial, hybrid
+    description      TEXT
+);
+
+COMMENT ON TABLE confinement_method IS
+'Catalog of plasma confinement methods.';
+
+COMMENT ON COLUMN confinement_method.method_category IS
+'High level grouping, for example magnetic, inertial, hybrid.';
+
+
+-- Facility status catalog to avoid ad hoc strings.
+CREATE TABLE IF NOT EXISTS facility_status (
+    status_id   SMALLSERIAL PRIMARY KEY,
+    status_name TEXT NOT NULL UNIQUE,  -- planned, under_construction, operational, standby, retired
+    description TEXT
+);
+
+COMMENT ON TABLE facility_status IS
+'Enumerates lifecycle states for a fusion facility.';
+
+
+-- Milestone type catalog to standardize facility timeline events.
+CREATE TABLE IF NOT EXISTS milestone_type (
+    milestone_type_id SMALLSERIAL PRIMARY KEY,
+    type_name         TEXT NOT NULL UNIQUE,  -- first_plasma, first_lasing, deuterium_tritium_ops, upgrade, shutdown
+    description       TEXT
+);
+
+COMMENT ON TABLE milestone_type IS
+'Kinds of dated milestones in a facility timeline.';
+
+
+-- ============================================================================
+-- 2) CORE ENTITIES
+-- ============================================================================
+
+-- Facilities table describes each laboratory or project site.
+CREATE TABLE IF NOT EXISTS facility (
+    facility_id           BIGSERIAL PRIMARY KEY,
+    facility_acronym      TEXT NOT NULL,        -- ITER, JET, NIF, W7-X, KSTAR, EAST, JT-60SA, SPARC, DIII-D, etc.
+    facility_name         TEXT NOT NULL,        -- Long name, for example National Ignition Facility
+    country               TEXT NOT NULL,
+    city                  TEXT,
+    operator_org          TEXT,                 -- Operating institution or consortium
+    method_id             SMALLINT NOT NULL REFERENCES confinement_method(method_id),
+    status_id             SMALLINT NOT NULL REFERENCES facility_status(status_id),
+    commissioning_year    INTEGER,              -- For historical sorting, nullable for planned sites
+    site_latitude         NUMERIC(9,6),
+    site_longitude        NUMERIC(9,6),
+    notes                 TEXT,
+    CONSTRAINT uq_facility_acronym UNIQUE (facility_acronym),
+    CONSTRAINT ck_commissioning_year CHECK (
+        commissioning_year IS NULL OR commissioning_year BETWEEN 1940 AND 2100
+    )
+);
+
+COMMENT ON TABLE facility IS
+'Fusion facilities with method, status, and basic metadata.';
+
+
+-- Facilities often have an official schedule of key milestones.
+CREATE TABLE IF NOT EXISTS facility_milestone (
+    milestone_id        BIGSERIAL PRIMARY KEY,
+    facility_id         BIGINT NOT NULL REFERENCES facility(facility_id) ON DELETE CASCADE,
+    milestone_type_id   SMALLINT NOT NULL REFERENCES milestone_type(milestone_type_id),
+    planned_date        DATE,            -- planned or achieved date
+    achieved_date       DATE,            -- if reached
+    description         TEXT,
+    CONSTRAINT ck_dates_order CHECK (
+        planned_date IS NULL OR achieved_date IS NULL OR achieved_date >= planned_date
+    )
+);
+
+COMMENT ON TABLE facility_milestone IS
+'Dated facility milestones, for example first plasma or upgrade.';
+
+
+-- Experiments table represents discrete experimental campaigns or named runs.
+CREATE TABLE IF NOT EXISTS experiment (
+    experiment_id   BIGSERIAL PRIMARY KEY,
+    facility_id     BIGINT NOT NULL REFERENCES facility(facility_id) ON DELETE CASCADE,
+    experiment_name TEXT NOT NULL,       -- campaign identifier, for example "DT campaign 2025A"
+    start_date      DATE,                -- date windows if known
+    end_date        DATE,
+    objective       TEXT,
+    CONSTRAINT ck_exp_dates CHECK (
+        end_date IS NULL OR start_date IS NULL OR end_date >= start_date
+    )
+);
+
+COMMENT ON TABLE experiment IS
+'Named experimental campaigns per facility.';
+
+
+-- Performance snapshots capture measured metrics at points in time.
+CREATE TABLE IF NOT EXISTS performance_snapshot (
+    snapshot_id         BIGSERIAL PRIMARY KEY,
+    experiment_id       BIGINT NOT NULL REFERENCES experiment(experiment_id) ON DELETE CASCADE,
+    measured_at         TIMESTAMPTZ NOT NULL DEFAULT now(),  -- UTC
+    max_ion_temp_keV    NUMERIC(10,3),   -- maximum ion temperature in keV
+    pulse_duration_s    NUMERIC(12,6),   -- pulse length in seconds
+    confinement_time_s  NUMERIC(12,6),   -- optional tau_E if available
+    q_plasma            NUMERIC(10,4),   -- plasma gain, often reported for magnetic devices
+    q_engineering       NUMERIC(10,4),   -- plant gain, usually lower, optional
+    neutron_yield       NUMERIC(20,3),   -- total neutrons, optional
+    record_flag         BOOLEAN NOT NULL DEFAULT FALSE,
+    notes               TEXT,
+    CONSTRAINT ck_nonnegatives CHECK (
+        coalesce(max_ion_temp_keV, 0) >= 0
+        AND coalesce(pulse_duration_s, 0) >= 0
+        AND coalesce(confinement_time_s, 0) >= 0
+        AND coalesce(q_plasma, 0) >= 0
+        AND coalesce(q_engineering, 0) >= 0
+        AND coalesce(neutron_yield, 0) >= 0
+    )
+);
+
+COMMENT ON TABLE performance_snapshot IS
+'Point in time performance metrics tied to an experiment.';
+
+
+-- ============================================================================
+-- 3) INDEXING FOR PERFORMANCE
+-- ============================================================================
+
+CREATE INDEX IF NOT EXISTS idx_facility_method ON facility(method_id);
+CREATE INDEX IF NOT EXISTS idx_facility_status ON facility(status_id);
+CREATE INDEX IF NOT EXISTS idx_milestone_facility ON facility_milestone(facility_id);
+CREATE INDEX IF NOT EXISTS idx_experiment_facility ON experiment(facility_id);
+CREATE INDEX IF NOT EXISTS idx_snapshot_experiment_time ON performance_snapshot(experiment_id, measured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_snapshot_q_plasma ON performance_snapshot(q_plasma DESC);
+CREATE INDEX IF NOT EXISTS idx_milestone_planned ON facility_milestone(planned_date) WHERE planned_date IS NOT NULL;
+
+-- ============================================================================
+-- 4) SEED LOOKUP DATA
+-- ============================================================================
+
+INSERT INTO confinement_method (method_name, method_category, description) VALUES
+    ('tokamak', 'magnetic', 'Toroidal magnetic confinement with strong toroidal and poloidal fields'),
+    ('stellarator', 'magnetic', 'Twisted toroidal magnetic confinement, steady state friendly'),
+    ('ICF', 'inertial', 'Inertial confinement fusion using high energy lasers or particle beams'),
+    ('spherical_tokamak', 'magnetic', 'Compact aspect ratio tokamak'),
+    ('mirror', 'magnetic', 'Open ended magnetic mirror configuration')
+ON CONFLICT (method_name) DO NOTHING;
+
+INSERT INTO facility_status (status_name, description) VALUES
+    ('planned', 'Planning or design phase'),
+    ('under_construction', 'Site construction or installation phase'),
+    ('operational', 'Active experimental operations'),
+    ('standby', 'Temporarily paused or awaiting campaign'),
+    ('retired', 'Decommissioned or closed')
+ON CONFLICT (status_name) DO NOTHING;
+
+INSERT INTO milestone_type (type_name, description) VALUES
+    ('first_plasma', 'First achieved plasma'),
+    ('first_lasing', 'First full power shot for ICF'),
+    ('upgrade', 'Major upgrade milestone'),
+    ('deuterium_tritium_ops', 'Deuterium tritium operations'),
+    ('shutdown', 'Permanent shutdown')
+ON CONFLICT (type_name) DO NOTHING;
+
+-- ============================================================================
+-- 5) SEED FACILITIES
+--     Note: Sample entries, update with authoritative data as needed.
+-- ============================================================================
+
+-- Helper: get method and status ids
+WITH ids AS (
+    SELECT
+        (SELECT method_id FROM confinement_method WHERE method_name = 'ICF')                AS icf,
+        (SELECT method_id FROM confinement_method WHERE method_name = 'tokamak')            AS tokamak,
+        (SELECT method_id FROM confinement_method WHERE method_name = 'stellarator')        AS stellarator,
+        (SELECT method_id FROM confinement_method WHERE method_name = 'spherical_tokamak')  AS spher_tok,
+        (SELECT status_id FROM facility_status WHERE status_name = 'operational')           AS op,
+        (SELECT status_id FROM facility_status WHERE status_name = 'retired')               AS retired,
+        (SELECT status_id FROM facility_status WHERE status_name = 'under_construction')    AS build,
+        (SELECT status_id FROM facility_status WHERE status_name = 'planned')               AS planned
+)
+INSERT INTO facility (facility_acronym, facility_name, country, city, operator_org, method_id, status_id, commissioning_year, site_latitude, site_longitude, notes)
+SELECT * FROM (
+    VALUES
+      ('NIF',    'National Ignition Facility',                    'United States', 'Livermore',         'Lawrence Livermore National Laboratory', (SELECT icf FROM ids),        (SELECT op FROM ids),     2009, 37.682, -121.705, 'Inertial confinement laser system'),
+      ('ITER',   'International Thermonuclear Experimental Reactor','France',      'Saint-Paul-lez-Durance','ITER Organization',                       (SELECT tokamak FROM ids),    (SELECT build FROM ids),  NULL, 43.713,   5.776, 'Large tokamak under construction'),
+      ('JET',    'Joint European Torus',                           'United Kingdom','Culham',            'UKAEA and EUROfusion',                      (SELECT tokamak FROM ids),    (SELECT retired FROM ids), 1983, 51.658,  -1.237, 'Historic tokamak, DT ops completed'),
+      ('W7-X',   'Wendelstein 7-X',                                'Germany',      'Greifswald',         'Max Planck Institute for Plasma Physics',   (SELECT stellarator FROM ids),(SELECT op FROM ids),     2015, 54.093,  13.377, 'Advanced stellarator'),
+      ('KSTAR',  'Korean Superconducting Tokamak Advanced Research','South Korea', 'Daejeon',            'KFE',                                        (SELECT tokamak FROM ids),    (SELECT op FROM ids),     2008, 36.385,  127.377, 'Long pulse superconducting tokamak'),
+      ('EAST',   'Experimental Advanced Superconducting Tokamak',  'China',        'Hefei',              'ASIPP',                                      (SELECT tokamak FROM ids),    (SELECT op FROM ids),     2006, 31.843,  117.267, 'Long duration plasma achievements'),
+      ('JT-60SA','JT-60 Super Advanced',                           'Japan',        'Naka',               'QST and Europe',                            (SELECT tokamak FROM ids),    (SELECT op FROM ids),     2024, 36.455,  140.532, 'Large superconducting tokamak'),
+      ('DIII-D', 'DIII-D National Fusion Facility',                'United States','San Diego',          'General Atomics for DOE',                   (SELECT tokamak FROM ids),    (SELECT op FROM ids),     1986, 32.899, -117.229, 'US tokamak with strong research output'),
+      ('SPARC',  'SPARC',                                          'United States','Devens',             'Commonwealth Fusion Systems with MIT PSFC', (SELECT tokamak FROM ids),    (SELECT build FROM ids),  NULL, 42.543,  -71.601, 'High field tokamak under construction')
+) v(facility_acronym, facility_name, country, city, operator_org, method_id, status_id, commissioning_year, site_latitude, site_longitude, notes)
+ON CONFLICT (facility_acronym) DO NOTHING;
+
+-- ============================================================================
+-- 6) SEED MILESTONES
+-- ==========
